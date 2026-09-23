@@ -1,4 +1,19 @@
-/* plat.c - SDL2 platform layer.  Software rendering only. */
+/* plat.c - the platform layer, for desktop SDL2 and for picosdl.
+ *
+ * The game (game.c) talks only to plat.h, which stands in for the DOS
+ * services the original used.  Most of that is the same whichever SDL is
+ * underneath - the XT scancode table, the getch() queue, the 60 Hz pacing
+ * and the PC-speaker square wave - and is written once, at the top.  What
+ * differs is the screen, the pointing devices and the audio format, and that
+ * is split on PICOSDL_SDL_H, which picosdl's <SDL2/SDL.h> defines:
+ *
+ *   desktop  a window, a streaming texture, the mouse, any joystick SDL finds
+ *   picosdl  one 320x200 byte-per-pixel canvas handed to the panel, the CGA
+ *            palette written into the display's CLUT, and the board's stick
+ *            and I2C pad standing in for both the game port and the keyboard
+ *
+ * Neither half allocates.
+ */
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,20 +21,24 @@
 #include "plat.h"
 #include "cga.h"
 
-#define PIT_HZ      1193181
-#define FRAME_HZ    60.0
-#define AUDIO_RATE  44100
+#ifndef KMOD_CAPS           /* picosdl tracks neither lock */
+#define KMOD_CAPS 0
+#endif
+#ifndef KMOD_NUM
+#define KMOD_NUM  0
+#endif
 
-static SDL_Window   *win;
-static SDL_Renderer *ren;
-static SDL_Texture  *tex;
-static Uint32        pal32[4];
-static int           logical_h = CGA_H;
+#define PIT_HZ      1193181u
+#define FRAME_HZ    60u
+
+void (*plat_frame_hook)(void);
 
 static int  raw_kbd;
-static int  quitting;
 
-/* ---- getch queue (cooked mode) ---- */
+/* ================================================================== */
+/* Keyboard: XT scan codes and the getch() queue (both builds)         */
+/* ================================================================== */
+
 #define QSZ 64
 static unsigned char kq[QSZ];
 static int kq_head, kq_tail;
@@ -27,24 +46,9 @@ static void kq_push(unsigned char c) { int n = (kq_tail + 1) % QSZ; if (n != kq_
 static int  kq_empty(void) { return kq_head == kq_tail; }
 static int  kq_pop(void) { int c; if (kq_empty()) return -1; c = kq[kq_head]; kq_head = (kq_head + 1) % QSZ; return c; }
 
-/* bioskey(0) wants the raw (scancode, ascii) pair */
+/* bioskey(0) wants the raw (scancode, ascii) pair; -1 is "cancelled" */
 static int  bk_have, bk_val;
 
-/* ---- mouse / joystick ---- */
-static int mouse_ok, mouse_dx_acc, mouse_btn;
-static SDL_Joystick *joys[2];
-static int joy_count;
-
-/* ---- PC speaker ---- */
-static SDL_AudioDeviceID audio_dev;
-static volatile int spk_div;        /* 0 = silent */
-static double spk_phase;
-static int sound_enabled = 1;
-static double spk_lp;
-
-/* ------------------------------------------------------------------ */
-/* XT (set 1) scancode table indexed by SDL scancode.                  */
-/* ------------------------------------------------------------------ */
 static unsigned char xt_of_sdl[SDL_NUM_SCANCODES];
 
 static void build_scancode_table(void)
@@ -133,9 +137,90 @@ static unsigned char ascii_of(SDL_Keysym k)
     }
 }
 
+/* A key event from whichever keyboard there is: into the INT 9 handler while
+ * a game is running, into the BIOS buffer otherwise. */
+static void key_event(const SDL_KeyboardEvent *k, int down)
+{
+    unsigned char xt = xt_of_sdl[k->keysym.scancode];
+    if (raw_kbd) {
+        if (xt) av_kbd_isr((unsigned char)(down ? xt : (xt | 0x80)));
+    } else if (down) {                  /* typematic repeat included, like the BIOS buffer */
+        unsigned char a = ascii_of(k->keysym);
+        bk_val = (xt << 8) | a; bk_have = 1;
+        if (a) kq_push(a);
+        else if (xt) { kq_push(0); kq_push(xt); }
+    }
+}
+
+/* ================================================================== */
+/* PC speaker (both builds)                                            */
+/*                                                                     */
+/* sound(f) programmed PIT channel 2 with 1193181/f; the square wave   */
+/* that divisor produces is synthesised here, in fixed point so the    */
+/* same code runs in the board's mixer on core 1.  A one-pole low-pass */
+/* takes the edge off without moving the pitch.                        */
+/* ================================================================== */
+static volatile unsigned spk_div;       /* 0 = silent */
+static volatile int      sound_enabled = 1;
+static unsigned          spk_phase;     /* 32-bit phase accumulator */
+static int               spk_lp;
+static int               audio_rate = 44100;
+static int               audio_channels = 1;
+
+#define SPK_AMPLITUDE 3800
+
+static void audio_cb(void *ud, Uint8 *stream, int len)
+{
+    Sint16 *out = (Sint16 *)stream;
+    int frames = len / (int)sizeof(Sint16) / audio_channels, i, c;
+    unsigned div = spk_div;
+    unsigned step = 0;
+    (void)ud;
+    if (div && sound_enabled)
+        step = (unsigned)((((unsigned long long)PIT_HZ) << 32) /
+                          ((unsigned long long)div * (unsigned)audio_rate));
+    for (i = 0; i < frames; i++) {
+        int target = 0;
+        if (step) {
+            spk_phase += step;
+            target = (spk_phase & 0x80000000u) ? -SPK_AMPLITUDE : SPK_AMPLITUDE;
+        }
+        spk_lp += ((target - spk_lp) * 45) / 128;
+        for (c = 0; c < audio_channels; c++) *out++ = (Sint16)spk_lp;
+    }
+}
+
+void plat_sound(int freq)
+{
+    if (freq <= 18) return;                 /* same guard as Turbo C's sound() */
+    spk_div = PIT_HZ / (unsigned)freq;
+}
+void plat_nosound(void) { spk_div = 0; }
+void plat_set_sound_enabled(int on) { sound_enabled = on; if (!on) spk_div = 0; }
+
+/* ================================================================== */
+/* The two back ends                                                   */
+/* ================================================================== */
+static void pump(void);
+static void present(void);
+
+#ifndef PICOSDL_SDL_H
+/* ------------------------------------------------------------------ */
+/* desktop SDL2                                                        */
+/* ------------------------------------------------------------------ */
+static SDL_Window   *win;
+static SDL_Renderer *ren;
+static SDL_Texture  *tex;
+static Uint32        pal32[4];
+static int           logical_h = CGA_H;
+static SDL_AudioDeviceID audio_dev;
+
+static int mouse_ok, mouse_dx_acc, mouse_btn;
+static SDL_Joystick *joys[2];
+static int joy_count;
+
 static void die_now(void)
 {
-    quitting = 1;
     plat_shutdown();
     exit(0);
 }
@@ -158,27 +243,16 @@ static void pump(void)
             if (e.button.button == SDL_BUTTON_LEFT) mouse_btn &= ~1;
             break;
         case SDL_KEYDOWN:
-        case SDL_KEYUP: {
-            unsigned char xt = xt_of_sdl[e.key.keysym.scancode];
+        case SDL_KEYUP:
             if ((e.key.keysym.mod & KMOD_ALT) && e.key.keysym.scancode == SDL_SCANCODE_F4 &&
                 e.type == SDL_KEYDOWN) die_now();
-            if (raw_kbd) {
-                if (xt) av_kbd_isr((unsigned char)(e.type == SDL_KEYDOWN ? xt : (xt | 0x80)));
-            } else if (e.type == SDL_KEYDOWN) {   /* typematic repeat included,
-                                                     like the BIOS buffer */
-                unsigned char a = ascii_of(e.key.keysym);
-                bk_val = (xt << 8) | a; bk_have = 1;
-                if (a) kq_push(a);
-                else if (xt) { kq_push(0); kq_push(xt); }
-            }
+            key_event(&e.key, e.type == SDL_KEYDOWN);
             break;
-        }
         default: break;
         }
     }
 }
 
-/* ------------------------------------------------------------------ */
 /* AV_DUMP=<file> writes every presented frame as raw RGB24 (or, if the name
  * ends in .hash, one 8-byte FNV-1a per frame); used by the A/B test harness to
  * compare against frames captured from DOSBox. */
@@ -253,92 +327,10 @@ static void present(void)
     SDL_RenderPresent(ren);
 }
 
-void plat_wait_retrace(void)
-{
-    static Uint64 next;
-    static double perf;
-    Uint64 now;
-    if (!perf) { perf = (double)SDL_GetPerformanceFrequency(); next = SDL_GetPerformanceCounter(); }
-    pump();
-    present();
-    next += (Uint64)(perf / FRAME_HZ);
-    now = SDL_GetPerformanceCounter();
-    if (next < now) { next = now; return; }
-    while ((now = SDL_GetPerformanceCounter()) < next) {
-        double ms = (double)(next - now) * 1000.0 / perf;
-        if (ms > 2.0) SDL_Delay((Uint32)(ms - 1.0));
-        else SDL_Delay(0);
-    }
-}
+int plat_can_quit(void) { return 1; }
 
-int plat_kbhit(void) { pump(); return !kq_empty(); }
+void plat_default_controls(char *pl1, char *pl2) { *pl1 = 'K'; *pl2 = 'K'; }
 
-int plat_getch(void)
-{
-    for (;;) {
-        int c;
-        pump();
-        c = kq_pop();
-        if (c >= 0) return c;
-        present();
-        SDL_Delay(5);
-    }
-}
-
-int plat_bioskey0(void)
-{
-    bk_have = 0;
-    kq_head = kq_tail = 0;
-    for (;;) {
-        pump();
-        if (bk_have) { kq_head = kq_tail = 0; return bk_val; }
-        present();
-        SDL_Delay(5);
-    }
-}
-
-void plat_set_raw_kbd(int on) { pump(); raw_kbd = on; kq_head = kq_tail = 0; }
-
-void plat_delay(int ms)
-{
-    Uint32 end = SDL_GetTicks() + (Uint32)ms;
-    while ((Sint32)(end - SDL_GetTicks()) > 0) { pump(); SDL_Delay(1); }
-}
-
-/* ------------------------------------------------------------------ */
-/* PC speaker                                                          */
-/* ------------------------------------------------------------------ */
-static void audio_cb(void *ud, Uint8 *stream, int len)
-{
-    Sint16 *out = (Sint16 *)stream;
-    int n = len / (int)sizeof(Sint16), i;
-    int div = spk_div;
-    double freq = (div && sound_enabled) ? (double)PIT_HZ / div : 0.0;
-    double step = freq / AUDIO_RATE;
-    (void)ud;
-    for (i = 0; i < n; i++) {
-        double target = 0.0;
-        if (freq > 0.0) {
-            spk_phase += step;
-            if (spk_phase >= 1.0) spk_phase -= 1.0;
-            target = (spk_phase < 0.5) ? 1.0 : -1.0;
-        }
-        /* one-pole smoothing keeps the square wave from sounding harsh
-         * without changing its pitch */
-        spk_lp += (target - spk_lp) * 0.35;
-        out[i] = (Sint16)(spk_lp * 3800.0);
-    }
-}
-
-void plat_sound(int freq)
-{
-    if (freq <= 18) return;                 /* same guard as Turbo C's sound() */
-    spk_div = PIT_HZ / freq;
-}
-void plat_nosound(void) { spk_div = 0; }
-void plat_set_sound_enabled(int on) { sound_enabled = on; if (!on) spk_div = 0; }
-
-/* ------------------------------------------------------------------ */
 int plat_mouse_present(void)  { return mouse_ok; }
 void plat_set_mouse_grab(int on)
 {
@@ -376,7 +368,6 @@ int plat_joystick_xaxis(int pad)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
 int plat_init(int scale, int aspect43, int fullscreen)
 {
     SDL_AudioSpec want, have;
@@ -411,11 +402,15 @@ int plat_init(int scale, int aspect43, int fullscreen)
                    ((Uint32)cga_palette[i][1] << 8) | cga_palette[i][2];
 
     SDL_memset(&want, 0, sizeof want);
-    want.freq = AUDIO_RATE; want.format = AUDIO_S16SYS; want.channels = 1;
+    want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 1;
     want.samples = 512; want.callback = audio_cb;
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (audio_dev) SDL_PauseAudioDevice(audio_dev, 0);
-    else fprintf(stderr, "warning: no audio device (%s); running silently\n", SDL_GetError());
+    if (audio_dev) {
+        audio_rate = have.freq; audio_channels = have.channels;
+        SDL_PauseAudioDevice(audio_dev, 0);
+    } else {
+        fprintf(stderr, "warning: no audio device (%s); running silently\n", SDL_GetError());
+    }
 
     {   /* plenty of HID devices enumerate as joysticks; keep only real ones */
         int n = SDL_NumJoysticks();
@@ -446,4 +441,248 @@ void plat_shutdown(void)
     if (ren) { SDL_DestroyRenderer(ren); ren = NULL; }
     if (win) { SDL_DestroyWindow(win); win = NULL; }
     SDL_Quit();
+}
+
+#else  /* PICOSDL_SDL_H */
+/* ------------------------------------------------------------------ */
+/* picosdl                                                             */
+/*                                                                     */
+/* The screen is one 320x200 canvas, a palette index a byte, handed to */
+/* the panel with PSDL_PresentBuffer(); CGA's four colours are entries */
+/* 0-3 of the display's CLUT.  A present only starts the transfer, so  */
+/* a frame whose predecessor is still being read is skipped rather     */
+/* than waited for: the game keeps the original's 60 Hz whatever the   */
+/* panel manages, and since every present converts the whole of        */
+/* cga_vram, a skipped frame loses nothing but itself.                 */
+/*                                                                     */
+/* Input is the board's analog stick and, if one answers, the I2C pad. */
+/* In the menus they become the keys the original read - up and down   */
+/* as the cursor keys' extended codes, a button as Enter.  In a game   */
+/* they are the game-port joystick, which on the PC both players read  */
+/* from the same port; Start or Back leaves the game, as Esc did.  A   */
+/* Bluetooth keyboard, in a build that has one, works exactly as the   */
+/* desktop's does.                                                     */
+/* ------------------------------------------------------------------ */
+static Uint8  canvas[CGA_W * CGA_H];
+static Uint32 expand[256];              /* one CGA byte -> four indices, little-endian */
+
+static SDL_GameController *pad;
+static SDL_Joystick       *stick;
+
+#define DEADZONE      12000
+#define REPEAT_FIRST  400u              /* ms before a held direction repeats */
+#define REPEAT_EVERY  120u
+
+typedef struct { int x, y, jump, leave; } Controls;
+static Controls held;
+static int      dir_held;               /* -1 up, +1 down, 0 none */
+static Uint32   dir_next;               /* when the held direction repeats */
+
+static void read_controls(Controls *c)
+{
+    int x = 0, y = 0;
+    memset(c, 0, sizeof *c);
+    if (pad) {
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  x = -1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) x = 1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP))    y = -1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  y = 1;
+        if (!x && !y) {
+            int ax = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+            int ay = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+            if (ax < -DEADZONE) x = -1; else if (ax > DEADZONE) x = 1;
+            if (ay < -DEADZONE) y = -1; else if (ay > DEADZONE) y = 1;
+        }
+        c->jump  = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) ||
+                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) ||
+                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+        c->leave = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) ||
+                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+    } else if (stick) {
+        int ax = SDL_JoystickGetAxis(stick, 0), ay = SDL_JoystickGetAxis(stick, 1);
+        if (ax < -DEADZONE) x = -1; else if (ax > DEADZONE) x = 1;
+        if (ay < -DEADZONE) y = -1; else if (ay > DEADZONE) y = 1;
+        c->jump = SDL_JoystickGetButton(stick, 0) != 0;
+    }
+    c->x = x; c->y = y;
+}
+
+/* The controls as the keyboard the menus and "Define Keys" expect. */
+static void controls_to_keys(const Controls *now)
+{
+    Uint32 t = SDL_GetTicks();
+    int pressed = (now->jump && !held.jump) || (now->leave && !held.leave);
+
+    if (raw_kbd) {
+        /* in a game only leaving is a key: Esc, down and up, as INT 9 sees it */
+        if (now->leave && !held.leave) { av_kbd_isr(0x01); av_kbd_isr(0x81); }
+        dir_held = 0;
+        return;
+    }
+    if (pressed) {
+        kq_push('\r');
+        bk_val = -1; bk_have = 1;           /* "Define Keys": keep the old key */
+    }
+    if (now->y != dir_held) {
+        dir_held = now->y;
+        dir_next = t + REPEAT_FIRST;
+        if (dir_held) { kq_push(0); kq_push(dir_held < 0 ? 0x48 : 0x50); }
+    } else if (dir_held && (Sint32)(t - dir_next) >= 0) {
+        dir_next = t + REPEAT_EVERY;
+        kq_push(0); kq_push(dir_held < 0 ? 0x48 : 0x50);
+    }
+}
+
+static void pump(void)
+{
+    SDL_Event e;
+    Controls now;
+    SDL_PumpEvents();
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)
+            key_event(&e.key, e.type == SDL_KEYDOWN);
+        else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad && SDL_IsGameController(0))
+            pad = SDL_GameControllerOpen(0);
+    }
+    read_controls(&now);
+    controls_to_keys(&now);
+    held = now;
+}
+
+static void present(void)
+{
+    int y, x;
+    if (PSDL_BufferBusy(canvas)) return;        /* the panel is still reading it */
+    for (y = 0; y < CGA_H; y++) {
+        const unsigned char *src = cga_vram + ((y & 1) ? CGA_BANK : 0)
+                                            + (y >> 1) * CGA_ROWBYTES;
+        Uint32 *o = (Uint32 *)(canvas + y * CGA_W);
+        for (x = 0; x < CGA_ROWBYTES; x++) o[x] = expand[src[x]];
+    }
+    PSDL_PresentBuffer(canvas, CGA_W, CGA_H, CGA_W);
+}
+
+int plat_can_quit(void) { return 0; }       /* there is nowhere to quit to */
+
+/* Nobody at a board can press Z, C or X: player one gets the stick and
+ * player two the computer, when there is a stick to give. */
+void plat_default_controls(char *pl1, char *pl2)
+{
+    *pl1 = (pad || stick) ? 'J' : 'K';
+    *pl2 = (pad || stick) ? 'C' : 'K';
+}
+
+int  plat_mouse_present(void)     { return 0; }
+void plat_set_mouse_grab(int on)  { (void)on; }
+int  plat_mouse_buttons(void)     { return 0; }
+int  plat_mouse_take_dx(void)     { return 0; }
+
+int plat_joystick_present(void)   { return pad != NULL || stick != NULL; }
+int plat_joystick_button(int p)   { (void)p; pump(); return held.jump; }
+int plat_joystick_xaxis(int p)    { (void)p; return held.x; }
+
+int plat_init(int scale, int aspect43, int fullscreen)
+{
+    SDL_AudioSpec want;
+    SDL_Color c[4];
+    int i;
+    (void)scale; (void)aspect43; (void)fullscreen;
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS |
+                 SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
+        printf("SDL_Init: %s\n", SDL_GetError());
+        return 0;
+    }
+    build_scancode_table();
+
+    for (i = 0; i < 4; i++) {
+        c[i].r = cga_palette[i][0]; c[i].g = cga_palette[i][1];
+        c[i].b = cga_palette[i][2]; c[i].a = SDL_ALPHA_OPAQUE;
+    }
+    SDL_SetPaletteColors(PSDL_GlobalPalette(), c, 0, 4);
+    for (i = 0; i < 256; i++)
+        expand[i] = (Uint32)((i >> 6) & 3)         | (Uint32)((i >> 4) & 3) << 8 |
+                    (Uint32)((i >> 2) & 3) << 16   | (Uint32)(i & 3) << 24;
+    memset(canvas, 0, sizeof canvas);
+
+    if (SDL_IsGameController(0)) pad = SDL_GameControllerOpen(0);
+    if (!pad && SDL_NumJoysticks() > 0) stick = SDL_JoystickOpen(0);
+
+    memset(&want, 0, sizeof want);
+    want.freq = 22050; want.format = AUDIO_S16SYS; want.channels = 2;
+    want.samples = 256; want.callback = audio_cb;
+    if (SDL_OpenAudio(&want, NULL) == 0) {
+        audio_rate = want.freq; audio_channels = 2;
+        SDL_PauseAudio(0);
+    } else {
+        printf("audio: %s; running silently\n", SDL_GetError());
+    }
+    return 1;
+}
+
+void plat_shutdown(void)
+{
+    PSDL_PresentSync();
+    SDL_CloseAudio();
+    SDL_Quit();
+}
+#endif /* PICOSDL_SDL_H */
+
+/* ================================================================== */
+/* Pacing and the DOS console calls (both builds)                      */
+/* ================================================================== */
+
+/* The CGA retrace: present, then hold the game to 60 Hz. */
+void plat_wait_retrace(void)
+{
+    static Uint64 next, period;
+    Uint64 now;
+    if (!period) {
+        period = SDL_GetPerformanceFrequency() / FRAME_HZ;
+        next = SDL_GetPerformanceCounter();
+    }
+    pump();
+    present();
+    if (plat_frame_hook) plat_frame_hook();
+    next += period;
+    now = SDL_GetPerformanceCounter();
+    if (next < now) { next = now; return; }
+    while ((now = SDL_GetPerformanceCounter()) < next) {
+        Uint64 ms = (next - now) * 1000u / SDL_GetPerformanceFrequency();
+        SDL_Delay(ms > 1 ? (Uint32)(ms - 1) : 0);
+    }
+}
+
+int plat_kbhit(void) { pump(); return !kq_empty(); }
+
+int plat_getch(void)
+{
+    for (;;) {
+        int c;
+        pump();
+        c = kq_pop();
+        if (c >= 0) return c;
+        present();
+        SDL_Delay(5);
+    }
+}
+
+int plat_bioskey0(void)
+{
+    bk_have = 0;
+    kq_head = kq_tail = 0;
+    for (;;) {
+        pump();
+        if (bk_have) { kq_head = kq_tail = 0; return bk_val; }
+        present();
+        SDL_Delay(5);
+    }
+}
+
+void plat_set_raw_kbd(int on) { pump(); raw_kbd = on; kq_head = kq_tail = 0; }
+
+void plat_delay(int ms)
+{
+    Uint32 end = SDL_GetTicks() + (Uint32)ms;
+    while ((Sint32)(end - SDL_GetTicks()) > 0) { pump(); SDL_Delay(1); }
 }

@@ -213,9 +213,10 @@ static int load_sprites(void)
 {
     unsigned char *rec[20];
     int i, off;
-    FILE *f;
 
     memcpy(avdat, av_dat_builtin, sizeof avdat);
+#ifndef AV_NO_DATA_FILE
+  { FILE *f;
 
     /* An av.dat in the working directory overrides the built-in copy, the way
      * the original loaded it.  DOS filenames are upper case, so accept both.
@@ -232,6 +233,8 @@ static int load_sprites(void)
             memcpy(avdat, av_dat_builtin, sizeof avdat);
         }
     }
+  }
+#endif
 
     /* The twenty records are used in place; only the pre-shifted copies need
      * room of their own. */
@@ -831,6 +834,7 @@ static int read_define_key(int y)
 {
     char shown[2];
     int k = plat_bioskey0();
+    if (k < 0) return -1;                   /* a board's pad: keep the old key */
     shown[0] = (char)(k & 0xff);
     shown[1] = 0;
     bgi_outtextxy(200, y, shown);
@@ -897,7 +901,8 @@ static int menu_screen(void)
                                           "PL2 Left  : ", "PL2 Right : ", "PL2 Jump  : " };
             for (i = 0; i < 6; i++) {
                 bgi_outtextxy(0x68, 0x28 + i * 8, lbl[i]);
-                keys[i / 3][i % 3] = read_define_key(0x28 + i * 8);
+                int k = read_define_key(0x28 + i * 8);
+                if (k >= 0) keys[i / 3][i % 3] = k;
             }
             for (i = 0; i < 7; i++)
                 cga_clr_image(0x68, (unsigned)(i * 8 + 0x28), blank_img);
@@ -919,6 +924,16 @@ static int menu_screen(void)
 /* ------------------------------------------------------------------ */
 /* main - 0x1a5                                                        */
 /* ------------------------------------------------------------------ */
+/* Point menu entry `m` (1 or 2) at the control whose name has `kind` - 'K',
+ * 'J', ' ' (mouse) or 'C' - in the fifth column, the character play_round()
+ * reads; left alone if this machine has no such control. */
+static void select_control(int m, char kind)
+{
+    int k;
+    for (k = 0; k < menus[m].count; k++)
+        if (menus[m].text[k][4] == kind) { menus[m].cur = k; return; }
+}
+
 int av_main(void)
 {
     int i, j;
@@ -929,7 +944,6 @@ int av_main(void)
     }
     sound_on   = 0;
     serve_side = 0;
-    if (getenv("AV_DETERMINISTIC")) { menus[1].cur = 3; menus[2].cur = 3; }
 
     if (!plat_mouse_present()) {                 /* drop " PLn  Mouse " */
         for (i = 1; i < 3; i++) {
@@ -947,13 +961,26 @@ int av_main(void)
         }
     }
 
+    {   /* who plays with what until the menu says otherwise: the original's
+         * keyboard and keyboard on a PC, the stick and the computer on a board */
+        char pl1, pl2;
+        plat_default_controls(&pl1, &pl2);
+        if (getenv("AV_DETERMINISTIC")) pl1 = pl2 = 'C';   /* the A/B harness */
+        select_control(1, pl1);
+        select_control(2, pl2);
+    }
+
     draw_court();
     px[0] = 0x40; px[1] = 0xe2;
     py[0] = 0xad; py[1] = 0xad;
 
-    while (menu_screen()) {
-        play_round();
-        serve_side ^= 1;
+    for (;;) {
+        if (menu_screen()) {
+            play_round();
+            serve_side ^= 1;
+        } else if (plat_can_quit()) {
+            break;
+        }
     }
     return 0;
 }
