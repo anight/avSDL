@@ -119,7 +119,8 @@ void av_kbd_isr(unsigned char sc)
     int i;
     if (sc == 0x81) quit_flag = 1;                /* Esc released -> quit */
     for (i = 0; i < 2; i++) {
-        if (menus[i + 1].cur != 0) continue;      /* not on "Keyboard"    */
+        if (menus[i + 1].text[menus[i + 1].cur][4] != 'K')
+            continue;                             /* not on "Keyboard"    */
         if (sc == keys[i][0])          keystate[i][0] = -2;
         if (sc == keys[i][0] + 0x80)   keystate[i][0] = 0;
         if (sc == keys[i][1])          keystate[i][1] = 2;
@@ -171,6 +172,7 @@ static const int rec_size[20] = {
     70, 70, 26, 266, 266, 306, 306, 266, 266, 306,
     306, 202, 326, 326, 326, 326, 182, 182, 182, 182
 };
+#ifndef AV_NO_DATA_FILE
 static const int rec_w[20] = {
      4,  4, 40,  37,  37,  37,  37,  37,  37,  37,
     37,  4, 38, 38, 38, 38, 28, 28, 28, 28
@@ -192,6 +194,7 @@ static int avdat_valid(const unsigned char *data)
     }
     return 1;
 }
+#endif
 
 /* 0x43a */
 /* Every buffer the game needs, sized at compile time.  Nothing here is
@@ -586,6 +589,15 @@ static void read_mouse(int p)
     keystate[p][0] = (dx < 0) ? -2 : 0;
 }
 
+/* Not in the original: a board's I2C pad, read like the joystick. */
+static void read_gamepad(int p)
+{
+    int ax = plat_gamepad_xaxis();
+    keystate[p][2] = plat_gamepad_button() ? 1 : 0;
+    keystate[p][1] = (ax > 0) ?  2 : 0;
+    keystate[p][0] = (ax < 0) ? -2 : 0;
+}
+
 /* 0x724 - joystick presence/centre calibration */
 static int joy_calibrate(void)
 {
@@ -764,8 +776,10 @@ static void play_round(void)
 
     c = menus[1].text[menus[1].cur][4];
     if (c == ' ') ctl1 = 2; else if (c == 'C') ctl1 = 3; else if (c == 'J') ctl1 = 1;
+    else if (c == 'G') ctl1 = 4;
     c = menus[2].text[menus[2].cur][4];
     if (c == ' ') ctl2 = 2; else if (c == 'C') ctl2 = 3; else if (c == 'J') ctl2 = 1;
+    else if (c == 'G') ctl2 = 4;
 
     plat_set_raw_kbd(1);
     if (ctl1 == 2 || ctl2 == 2) plat_set_mouse_grab(1);
@@ -778,12 +792,14 @@ static void play_round(void)
         case 1: read_joystick(0); break;
         case 2: if (alt) read_mouse(0); break;
         case 3: ai_left(); break;
+        case 4: read_gamepad(0); break;
         default: break;
         }
         switch (ctl2) {
         case 1: read_joystick(1); break;
         case 2: if (alt) read_mouse(1); break;
         case 3: ai_right(); break;
+        case 4: read_gamepad(1); break;
         default: break;
         }
         alt = 1 - alt;
@@ -807,9 +823,34 @@ static void play_round(void)
 /* ------------------------------------------------------------------ */
 
 /* 0x63f - idle: the two players bounce about behind the menu. */
+/* Can this control be played with right now?  Only the keyboard comes and
+ * goes - a board's Bluetooth one - and on a PC every answer is yes, so there
+ * the menu is the original's. */
+static int control_available(const Menu *m, int k)
+{
+    return m->text[k][4] != 'K' || plat_keyboard_present();
+}
+
+/* Move a player menu off a control that cannot be used, to the next that can;
+ * returns whether it moved.  "Computer" always can, so this ends. */
+static int skip_unavailable(int m)
+{
+    int n;
+    for (n = 0; n < menus[m].count; n++) {
+        if (control_available(&menus[m], menus[m].cur)) return n != 0;
+        menus[m].cur = (menus[m].cur + 1) % menus[m].count;
+    }
+    return 1;
+}
+
+#define MENU_REFRESH (-2)      /* not a key: a player's control went away */
+
 static int idle_anim(void)
 {
     while (!plat_kbhit()) {
+        if (!control_available(&menus[1], menus[1].cur) ||
+            !control_available(&menus[2], menus[2].cur))
+            return MENU_REFRESH;
         int x1, x2;
         rng_tick();
         if (jumpidx[side] == -1) {
@@ -861,9 +902,20 @@ static int menu_select(void)
                     cga_clr_image(0x68, (unsigned)(i * 8 + 0x28), blank_img);
                 return sel;
             }
-            menus[sel].cur = (menus[sel].cur + 1) % menus[sel].count;
+            do menus[sel].cur = (menus[sel].cur + 1) % menus[sel].count;
+            while (!control_available(&menus[sel], menus[sel].cur));
             cga_clr_image(0x68, (unsigned)(sel * 8 + 0x28), blank_img);
             bgi_outtextxy(0x70, sel * 8 + 0x28, menus[sel].text[menus[sel].cur]);
+        } else if (ch == MENU_REFRESH) {
+            /* the keyboard a player was on has gone: move them off it and
+             * redraw that line, taking the highlight with it if it was there */
+            for (i = 1; i < 3; i++) {
+                if (!skip_unavailable(i)) continue;
+                cga_clr_image(0x68, (unsigned)(i * 8 + 0x28), blank_img);
+                bgi_outtextxy(0x70, i * 8 + 0x28, menus[i].text[menus[i].cur]);
+                if (i == sel) cga_xor_image(0x68, (unsigned)(i * 8 + 0x28), blank_img);
+            }
+            continue;
         } else {
             if (plat_kbhit()) ch = plat_getch();     /* extended key tail */
             plat_sound(4000); plat_nosound();        /* the menu click    */
@@ -945,7 +997,10 @@ int av_main(void)
     sound_on   = 0;
     serve_side = 0;
 
-    if (!plat_mouse_present()) {                 /* drop " PLn  Mouse " */
+    if (plat_gamepad_present()) {                /* a board: the pad takes the mouse's slot */
+        memcpy(menus[1].text[2], "PL1 Gamepad ", 13);
+        memcpy(menus[2].text[2], "PL2 Gamepad ", 13);
+    } else if (!plat_mouse_present()) {          /* drop " PLn  Mouse " */
         for (i = 1; i < 3; i++) {
             for (j = 0; j < 14; j++) menus[i].text[2][j] = menus[i].text[3][j];
             menus[i].count--;
@@ -968,6 +1023,8 @@ int av_main(void)
         if (getenv("AV_DETERMINISTIC")) pl1 = pl2 = 'C';   /* the A/B harness */
         select_control(1, pl1);
         select_control(2, pl2);
+        skip_unavailable(1);
+        skip_unavailable(2);
     }
 
     draw_court();

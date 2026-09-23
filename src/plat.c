@@ -9,8 +9,9 @@
  *
  *   desktop  a window, a streaming texture, the mouse, any joystick SDL finds
  *   picosdl  one 320x200 byte-per-pixel canvas handed to the panel, the CGA
- *            palette written into the display's CLUT, and the board's stick
- *            and I2C pad standing in for both the game port and the keyboard
+ *            palette written into the display's CLUT, the board's stick as
+ *            the game port, the I2C pad in the mouse's menu slot, and a
+ *            Bluetooth keyboard where the build has one
  *
  * Neither half allocates.
  */
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "plat.h"
 #include "cga.h"
 
@@ -340,6 +342,13 @@ void plat_set_mouse_grab(int on)
 int plat_mouse_buttons(void)  { pump(); return mouse_btn; }
 int plat_mouse_take_dx(void)  { int d; pump(); d = mouse_dx_acc; mouse_dx_acc = 0; return d; }
 
+int plat_keyboard_present(void) { return 1; }
+
+/* On a PC the menu slot is the mouse's; pads are joysticks, as they were. */
+int plat_gamepad_present(void) { return 0; }
+int plat_gamepad_button(void)  { return 0; }
+int plat_gamepad_xaxis(void)   { return 0; }
+
 int plat_joystick_present(void) { return joy_count > 0; }
 int plat_joystick_button(int pad)
 {
@@ -455,63 +464,89 @@ void plat_shutdown(void)
 /* panel manages, and since every present converts the whole of        */
 /* cga_vram, a skipped frame loses nothing but itself.                 */
 /*                                                                     */
-/* Input is the board's analog stick and, if one answers, the I2C pad. */
-/* In the menus they become the keys the original read - up and down   */
-/* as the cursor keys' extended codes, a button as Enter.  In a game   */
-/* they are the game-port joystick, which on the PC both players read  */
-/* from the same port; Start or Back leaves the game, as Esc did.  A   */
-/* Bluetooth keyboard, in a build that has one, works exactly as the   */
-/* desktop's does.                                                     */
+/* Three input sources, each its own entry in the menu:                */
+/*   Keyboard  a Bluetooth keyboard, selectable while one is connected; */
+/*             it works exactly as the desktop's                        */
+/*   Joystick  the board's analog stick, standing in for the PC's game  */
+/*             port: left, right, and the click to jump                 */
+/*   Gamepad   the I2C pad, in the slot a PC gives the mouse: its       */
+/*             stick, A or B to jump                                    */
+/* Outside a game all of them drive the menus as the keys the original  */
+/* read - up and down as the cursor keys' extended codes, a button as   */
+/* Enter.  In a game the pad's Start or Back leaves it, as Esc did.     */
 /* ------------------------------------------------------------------ */
 static Uint8  canvas[CGA_W * CGA_H];
 static Uint32 expand[256];              /* one CGA byte -> four indices, little-endian */
 
-static SDL_GameController *pad;
-static SDL_Joystick       *stick;
+static SDL_GameController *pad;        /* the I2C pad, if one answered at boot */
+static SDL_Joystick       *stick;      /* the board's own analog stick          */
 
 #define DEADZONE      12000
 #define REPEAT_FIRST  400u              /* ms before a held direction repeats */
 #define REPEAT_EVERY  120u
 
-typedef struct { int x, y, jump, leave; } Controls;
+/* One frame's worth of every source, read once in pump(). */
+typedef struct {
+    int stick_x, stick_y, stick_btn;    /* the board's stick                   */
+    int pad_x, pad_y, pad_btn;          /* the pad: its stick, A or B          */
+    int leave;                          /* the pad's Start or Back             */
+} Controls;
 static Controls held;
 static int      dir_held;               /* -1 up, +1 down, 0 none */
 static Uint32   dir_next;               /* when the held direction repeats */
 
-static void read_controls(Controls *c)
+static int axis_dir(int v) { return v < -DEADZONE ? -1 : v > DEADZONE ? 1 : 0; }
+
+/*
+ * The pad's own stick, taken back out of the controller.  picosdl feeds both
+ * the board's stick and the pad's into the controller's left stick, the larger
+ * deflection winning per axis, so that a game reading only the controller
+ * still hears the board.  Here each is a different player's, so the board's -
+ * which picosdl also keeps on joystick 0 - is subtracted back out: a
+ * controller axis that differs from the board's is the pad's exactly; one that
+ * equals it means the pad was pushed no further than the board, which reads
+ * as centred unless the board is centred too.
+ */
+static int pad_axis(int controller, int board)
 {
-    int x = 0, y = 0;
-    memset(c, 0, sizeof *c);
-    if (pad) {
-        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  x = -1;
-        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) x = 1;
-        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP))    y = -1;
-        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  y = 1;
-        if (!x && !y) {
-            int ax = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-            int ay = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-            if (ax < -DEADZONE) x = -1; else if (ax > DEADZONE) x = 1;
-            if (ay < -DEADZONE) y = -1; else if (ay > DEADZONE) y = 1;
-        }
-        c->jump  = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) ||
-                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) ||
-                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK);
-        c->leave = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) ||
-                   SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
-    } else if (stick) {
-        int ax = SDL_JoystickGetAxis(stick, 0), ay = SDL_JoystickGetAxis(stick, 1);
-        if (ax < -DEADZONE) x = -1; else if (ax > DEADZONE) x = 1;
-        if (ay < -DEADZONE) y = -1; else if (ay > DEADZONE) y = 1;
-        c->jump = SDL_JoystickGetButton(stick, 0) != 0;
-    }
-    c->x = x; c->y = y;
+    if (controller != board) return controller;
+    return axis_dir(board) == 0 ? controller : 0;
 }
 
-/* The controls as the keyboard the menus and "Define Keys" expect. */
+static void read_controls(Controls *c)
+{
+    int bx = 0, by = 0;
+    memset(c, 0, sizeof *c);
+    if (stick) {
+        bx = SDL_JoystickGetAxis(stick, 0);
+        by = SDL_JoystickGetAxis(stick, 1);
+        c->stick_x   = axis_dir(bx);
+        c->stick_y   = axis_dir(by);
+        c->stick_btn = SDL_JoystickGetButton(stick, 0) != 0;
+    }
+    if (pad) {
+        c->pad_x = axis_dir(pad_axis(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX), bx));
+        c->pad_y = axis_dir(pad_axis(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY), by));
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  c->pad_x = -1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) c->pad_x = 1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP))    c->pad_y = -1;
+        if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  c->pad_y = 1;
+        c->pad_btn = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) ||
+                     SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B);
+        c->leave   = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) ||
+                     SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+    }
+}
+
+/* Outside a game every source drives the menus, as the keys they expect:
+ * up and down as the cursor keys' extended codes, any button as Enter. */
 static void controls_to_keys(const Controls *now)
 {
     Uint32 t = SDL_GetTicks();
-    int pressed = (now->jump && !held.jump) || (now->leave && !held.leave);
+    int y = now->stick_y ? now->stick_y : now->pad_y;
+    int pressed = (now->stick_btn && !held.stick_btn) ||
+                  (now->pad_btn   && !held.pad_btn)   ||
+                  (now->leave     && !held.leave);
 
     if (raw_kbd) {
         /* in a game only leaving is a key: Esc, down and up, as INT 9 sees it */
@@ -523,8 +558,8 @@ static void controls_to_keys(const Controls *now)
         kq_push('\r');
         bk_val = -1; bk_have = 1;           /* "Define Keys": keep the old key */
     }
-    if (now->y != dir_held) {
-        dir_held = now->y;
+    if (y != dir_held) {
+        dir_held = y;
         dir_next = t + REPEAT_FIRST;
         if (dir_held) { kq_push(0); kq_push(dir_held < 0 ? 0x48 : 0x50); }
     } else if (dir_held && (Sint32)(t - dir_next) >= 0) {
@@ -538,12 +573,9 @@ static void pump(void)
     SDL_Event e;
     Controls now;
     SDL_PumpEvents();
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)
+    while (SDL_PollEvent(&e))
+        if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)   /* a Bluetooth keyboard */
             key_event(&e.key, e.type == SDL_KEYDOWN);
-        else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad && SDL_IsGameController(0))
-            pad = SDL_GameControllerOpen(0);
-    }
     read_controls(&now);
     controls_to_keys(&now);
     held = now;
@@ -564,22 +596,36 @@ static void present(void)
 
 int plat_can_quit(void) { return 0; }       /* there is nowhere to quit to */
 
-/* Nobody at a board can press Z, C or X: player one gets the stick and
- * player two the computer, when there is a stick to give. */
+/* Nobody at a board can press Z, C or X without a Bluetooth keyboard: player
+ * one gets the stick (or the pad, if that is all there is) and player two the
+ * computer. */
 void plat_default_controls(char *pl1, char *pl2)
 {
-    *pl1 = (pad || stick) ? 'J' : 'K';
-    *pl2 = (pad || stick) ? 'C' : 'K';
+    *pl1 = stick ? 'J' : pad ? 'G' : plat_keyboard_present() ? 'K' : 'C';
+    *pl2 = (stick || pad || !plat_keyboard_present()) ? 'C' : 'K';
 }
+
+/* "Keyboard" while a Bluetooth keyboard is connected, asked of picosdl's
+ * backend every time: it pairs some seconds after boot and can go away
+ * again.  In a build without Bluetooth the answer is always no. */
+bool psdl_pico_keyboard_connected(void);    /* picosdl/backend/pico/psdl_pico.h */
+
+int plat_keyboard_present(void) { return psdl_pico_keyboard_connected() ? 1 : 0; }
 
 int  plat_mouse_present(void)     { return 0; }
 void plat_set_mouse_grab(int on)  { (void)on; }
 int  plat_mouse_buttons(void)     { return 0; }
 int  plat_mouse_take_dx(void)     { return 0; }
 
-int plat_joystick_present(void)   { return pad != NULL || stick != NULL; }
-int plat_joystick_button(int p)   { (void)p; pump(); return held.jump; }
-int plat_joystick_xaxis(int p)    { (void)p; return held.x; }
+/* "Joystick" is the board's stick, which is what the PC's game port was. */
+int plat_joystick_present(void)   { return stick != NULL; }
+int plat_joystick_button(int p)   { (void)p; pump(); return held.stick_btn; }
+int plat_joystick_xaxis(int p)    { (void)p; return held.stick_x; }
+
+/* "Gamepad" is the I2C pad, in the menu slot a PC gives the mouse. */
+int plat_gamepad_present(void)    { return pad != NULL; }
+int plat_gamepad_button(void)     { pump(); return held.pad_btn; }
+int plat_gamepad_xaxis(void)      { return held.pad_x; }
 
 int plat_init(int scale, int aspect43, int fullscreen)
 {
@@ -605,8 +651,9 @@ int plat_init(int scale, int aspect43, int fullscreen)
                     (Uint32)((i >> 2) & 3) << 16   | (Uint32)(i & 3) << 24;
     memset(canvas, 0, sizeof canvas);
 
+    /* Both, when both are there: they are different players' controls. */
+    if (SDL_NumJoysticks() > 0) stick = SDL_JoystickOpen(0);
     if (SDL_IsGameController(0)) pad = SDL_GameControllerOpen(0);
-    if (!pad && SDL_NumJoysticks() > 0) stick = SDL_JoystickOpen(0);
 
     memset(&want, 0, sizeof want);
     want.freq = 22050; want.format = AUDIO_S16SYS; want.channels = 2;

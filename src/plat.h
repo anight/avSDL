@@ -32,7 +32,7 @@ extern void (*plat_frame_hook)(void);
 int  plat_can_quit(void);
 
 /* The controls each player starts with, as the fifth character of the menu
- * entry: 'K'eyboard, 'J'oystick, ' ' mouse or 'C'omputer. */
+ * entry: 'K'eyboard, 'J'oystick, ' ' mouse, 'G'amepad or 'C'omputer. */
 void plat_default_controls(char *pl1, char *pl2);
 
 /* PC speaker */
@@ -45,6 +45,15 @@ int  plat_mouse_present(void);
 void plat_set_mouse_grab(int on);
 int  plat_mouse_buttons(void);
 int  plat_mouse_take_dx(void);
+
+/* Is there a keyboard right now?  Always on a PC; on a board, while a
+ * Bluetooth keyboard is connected - which it may be, or stop being, at any time. */
+int  plat_keyboard_present(void);
+
+/* the I2C pad on a board, offered in the mouse's menu slot; never on a PC */
+int  plat_gamepad_present(void);
+int  plat_gamepad_button(void);
+int  plat_gamepad_xaxis(void);           /* -1, 0, +1 */
 
 /* game port */
 int  plat_joystick_present(void);
